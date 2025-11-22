@@ -1,0 +1,422 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 4) in;
+layout(r32f, binding = 0) uniform image2D u_coneDepth;
+layout(rgba32f, binding = 1) uniform image2D u_output;
+
+#include "hg_sdf.hlsl"
+
+// ──────────────────────────────────────────────────────────────────────── //
+//                            VARIABLES & UNIFORMS                          //
+// ──────────────────────────────────────────────────────────────────────── //
+uniform int   u_pass;
+uniform ivec2 u_fullRes;
+uniform ivec2 u_coneRes;
+uniform float u_fov;
+uniform float u_time;
+
+// ─────────────────────────── Camera & Output ──────────────────────────── //
+uniform vec3  u_camPos;
+uniform vec3  u_camRot;
+uniform int   u_buffer;     
+
+// ─────────────────────────── Render constants ─────────────────────────── //
+const float   u_maxDist = 100.0f;
+const float   u_epsilon = 0.001f;
+const int     u_maxStepsCone = 128;
+const int     u_maxStepsMain = 128;
+
+const vec3    u_bgColor = vec3(0.05f, 0.05f, 0.1f);
+
+// ──────────────────────────────────────────────────────────────────────── //
+//                              TYPES & UTILITIES                           //
+// ──────────────────────────────────────────────────────────────────────── //
+
+struct Ray {
+    vec3 origin;
+    vec3 dir;
+};
+
+float smin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+// ──────────────────────────────────────────────────────────────────────── //
+//                             CAMERA & RAY SETUP                           //
+// ──────────────────────────────────────────────────────────────────────── //
+
+Ray makePrimaryRay(vec2 fragCoord, vec2 resolution) {
+    // Normalize coordinates to [0, 1] and convert to [-1, 1]
+    vec2 ndc = (fragCoord / resolution) * 2.0f - 1.0f;
+    float aspect = resolution.x / resolution.y;
+    ndc.x *= aspect;
+    
+    // ───────────────────── //
+    //    Camera  rotation   //
+    // ───────────────────── //
+    float pitch = u_camRot.x;
+    float yaw = u_camRot.y;
+
+    float cp = cos(pitch);
+    float sp = sin(pitch);
+    float cy = cos(yaw);
+    float sy = sin(yaw);
+
+    mat3 rotX = mat3(
+        1.0, 0.0, 0.0,
+        0.0, cp, -sp,
+        0.0, sp,  cp
+    );
+
+    mat3 rotY = mat3(
+         cy, 0.0, sy,
+         0.0, 1.0, 0.0,
+        -sy, 0.0, cy
+    );
+    // ───────────────────── //
+    // ───────────────────── //
+    // ───────────────────── //
+
+    vec3 rayDir = normalize(vec3(ndc * u_fov, 1.0));
+    vec3 rotatedRayDir  = normalize(rotY * rotX * rayDir);
+
+    Ray r;
+    r.origin = u_camPos;
+    r.dir    = rotatedRayDir;
+    return r;
+}
+
+// ──────────────────────────────────────────────────────────────────────── //
+//                             SDF SCENE COMPUTE                            //
+// ──────────────────────────────────────────────────────────────────────── //
+
+float DE(vec3 p)
+{
+    // Apply time-based rotation
+    float timeRotX = u_time * 0.3;
+    float timeRotY = u_time * 0.5;
+    
+    float cx = cos(timeRotX);
+    float sx = sin(timeRotX);
+    p.yz = vec2(p.y * cx - p.z * sx, p.y * sx + p.z * cx);
+    
+    float cy = cos(timeRotY);
+    float sy = sin(timeRotY);
+    p.xz = vec2(p.x * cy + p.z * sy, -p.x * sy + p.z * cy);
+    
+    // Create unfolding effect: vary power and zoom over time
+    float power = mix(2.0, 8.0, sin(u_time * 0.5) * 0.5 + 0.5); // Morphs between power 2 and 8
+    float zoom = 1.0 + sin(u_time * 0.3) * 0.5; // Subtle zoom pulsing
+    
+    p *= zoom;
+    
+    vec3 z = p;
+    float dr = 1.0;
+    float r = 0.0;
+    
+    for(int i = 0; i < 12; i++) {
+        r = length(z);
+        if(r > 2.0) break;
+        
+        // ────────────────────────────────────────────────────────────────
+        // BOX FOLD TRANSFORM (creates cubic/geometric patterns)
+        // ────────────────────────────────────────────────────────────────
+        float boxFold = 1.0;
+        if(z.x > boxFold) z.x = 2.0 * boxFold - z.x;
+        if(z.y > boxFold) z.y = 2.0 * boxFold - z.y;
+        if(z.z > boxFold) z.z = 2.0 * boxFold - z.z;
+        
+        if(z.x < -boxFold) z.x = -2.0 * boxFold - z.x;
+        if(z.y < -boxFold) z.y = -2.0 * boxFold - z.y;
+        if(z.z < -boxFold) z.z = -2.0 * boxFold - z.z;
+        
+        // ────────────────────────────────────────────────────────────────
+        // SPHERICAL FOLD TRANSFORM (radius inversion)
+        // ────────────────────────────────────────────────────────────────
+        float sphereFold = 0.0;
+        float rSq = dot(z, z);
+        if(rSq < 0.5) {
+            z *= 4.0; // Inner fold
+            dr *= 4.0;
+        } else if(rSq < sphereFold) {
+            float fac = sphereFold / rSq;
+            z *= fac;
+            dr *= fac;
+        }
+        
+        // ────────────────────────────────────────────────────────────────
+        // SINE WARP (adds organic ripples and deformations)
+        // ────────────────────────────────────────────────────────────────
+        z.x += sin(z.y * 2.0 + u_time * 0.5) * 0.15;
+        z.y += cos(z.z * 2.0 + u_time * 0.3) * 0.15;
+        z.z += sin(z.x * 1.5) * 0.1;
+        
+        // ────────────────────────────────────────────────────────────────
+        // MANDELBULB POWER ITERATION
+        // ────────────────────────────────────────────────────────────────
+        // Convert to spherical coordinates
+        float theta = acos(clamp(z.z / r, -1.0, 1.0));
+        float phi = atan(z.y, z.x);
+        
+        dr = pow(r, power - 1.0) * power * dr + 1.0;
+        
+        r = pow(r, power);
+        theta = theta * power;
+        phi = phi * power;
+        
+        // Convert back to Cartesian
+        z = r * vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta)) + p;
+    }
+    
+    return 0.5 * log(r) * r / dr;
+}
+
+// Simple demo scene: a sphere over a floor
+float sdfScene(vec3 p) {
+    //return fBlob(p); 
+    return DE(p);
+}
+
+// ──────────────────────────────────────────────────────────────────────── //
+//                             NORMAL & SHADING                             //
+// ──────────────────────────────────────────────────────────────────────── //
+
+vec3 calcNormal(vec3 p) {
+    const vec2 e = vec2(1.0, -1.0) * 0.001;
+
+    return normalize(
+        e.xyy * sdfScene(p + e.xyy) +
+        e.yyx * sdfScene(p + e.yyx) +
+        e.yxy * sdfScene(p + e.yxy) +
+        e.xxx * sdfScene(p + e.xxx)
+    );
+}
+
+vec3 shade(vec3 pos, vec3 n, vec3 rayDir) {
+    vec3 lightDir = normalize(vec3(0.3, 0.7, 0.2));
+    float diff    = max(dot(n, lightDir), 0.0);
+    float spec    = pow(max(dot(reflect(-lightDir, n), -rayDir), 0.0), 32.0);
+
+    vec3 baseColor = vec3(0.4, 0.75, 1.0);
+    vec3 col = baseColor * (0.2 + 0.8 * diff) + vec3(1.0) * spec * 0.25;
+    return col;
+}
+
+// ──────────────────────────────────────────────────────────────────────── //
+//                           CONE PREPASS (PASS 0)                          //
+//                  Or how i like to call it... a cat prepass               //
+//                                                                          //
+//                                   ╱|、                                   //
+//                                  (˚ˎ。7                                  //
+//                                   |、˜〵        < Thats me               //
+//                                   じし ˍ,)ノ     while I write this code //
+// ──────────────────────────────────────────────────────────────────────── //
+
+void runConePrepass() {
+    ivec2 gliID = ivec2(gl_GlobalInvocationID.xy);
+    // Clamp to avoid out-of-bounds writes
+    if (gliID.x >= u_coneRes.x || gliID.y >= u_coneRes.y)
+        return;
+
+    // Convert cone cell coordinates to full-resolution pixel coordinates (center of cell)
+    vec2 pixelsPerCone = vec2(u_fullRes) / vec2(u_coneRes);
+    vec2 fullResCoord = (vec2(gliID) + vec2(0.5)) * pixelsPerCone;
+    
+    Ray ray = makePrimaryRay(fullResCoord, vec2(u_fullRes));
+
+    float blockHalf = max(pixelsPerCone.x, pixelsPerCone.y) * 0.5;
+
+    float pixelSizeY_at_z1 = 2.0 * tan(u_fov * 0.5) / float(u_fullRes.y);
+    float coneAngle        = blockHalf * pixelSizeY_at_z1;
+
+    float t     = 0.0;
+    float safeT = u_maxDist; // default = no hit
+
+    for (int i = 0; i < u_maxStepsCone; ++i) {
+        vec3 pos = ray.origin + t * ray.dir;
+
+        float d  = sdfScene(pos);
+        float cr = t * coneAngle;    // cone radius at distance t
+
+        // If distance <= cone radius, the cone is touching geometry
+        if (d <= cr) {
+            // conservative depth a bit before actual contact
+            safeT = max(t - cr, 0.0);
+            break;
+        }
+
+        // cone-aware step; 0.001 avoids stall when d ~ cr
+        float stepLen = max(d - cr, 0.001);
+        t += stepLen;
+
+        if (t > u_maxDist)
+            break;
+    }
+
+    float depthNorm = safeT;
+    imageStore(u_coneDepth, gliID, vec4(1.0, 0.0, 0.0, 1.0));
+
+}
+
+// ──────────────────────────────────────────────────────────────────────── //
+//                          MAIN RAY MARCH (PASS 1)                         //
+// ──────────────────────────────────────────────────────────────────────── //
+
+float sampleConeDepthBilinear(ivec2 pixel) {
+    // Map full-res pixel to cone grid float coords
+    vec2 scale = vec2(u_coneRes) / vec2(u_fullRes);
+    vec2 gridPos = (vec2(pixel) + vec2(0.5)) * scale - vec2(0.5);
+
+    ivec2 i0 = ivec2(floor(gridPos));
+    ivec2 i1 = i0 + ivec2(1, 0);
+    ivec2 i2 = i0 + ivec2(0, 1);
+    ivec2 i3 = i0 + ivec2(1, 1);
+
+    vec2 f = fract(gridPos);
+
+    i0 = clamp(i0, ivec2(0), u_coneRes - ivec2(1));
+    i1 = clamp(i1, ivec2(0), u_coneRes - ivec2(1));
+    i2 = clamp(i2, ivec2(0), u_coneRes - ivec2(1));
+    i3 = clamp(i3, ivec2(0), u_coneRes - ivec2(1));
+
+    float d00 = imageLoad(u_coneDepth, i0).r;
+    float d10 = imageLoad(u_coneDepth, i1).r;
+    float d01 = imageLoad(u_coneDepth, i2).r;
+    float d11 = imageLoad(u_coneDepth, i3).r;
+
+    float dx0 = mix(d00, d10, f.x);
+    float dx1 = mix(d01, d11, f.x);
+    float d   = mix(dx0, dx1, f.y);
+
+    return d;
+}
+
+void runMainRaymarch() {
+    ivec2 gliID = ivec2(gl_GlobalInvocationID.xy);
+    if (gliID.x >= u_fullRes.x || gliID.y >= u_fullRes.y)
+        return;
+
+    Ray ray = makePrimaryRay(gliID, u_fullRes);
+    float tCone = sampleConeDepthBilinear(gliID);
+
+    // If cone pass didn’t hit anything, tCone will be ~u_maxDist
+    if (tCone >= u_maxDist - 1e-3) {
+        imageStore(u_output, gliID, vec4(u_bgColor, 1.0));
+        return;
+    }
+
+    // Start a bit *before* cone depth to be safe
+    float t = max(tCone - 1.0, 0.0);
+
+    bool hit = false;
+    vec3 hitPos = vec3(0.0);
+    int stepCount = 0;
+    float minDistance = u_maxDist;  // Track minimum distance to surface (for glow)
+
+    for (int i = 0; i < u_maxStepsMain; ++i) {
+        hitPos = ray.origin + t * ray.dir;
+        float d = sdfScene(hitPos);
+        
+        minDistance = min(minDistance, d);  // Track closest approach
+        stepCount = i;
+
+        if (d < u_epsilon) {
+            hit = true;
+            break;
+        }
+
+        t += d;
+        if (t > u_maxDist)
+            break;
+    }
+
+    vec4 outCol = vec4(u_bgColor, 1.0);
+
+    if (hit) {
+        vec3 n   = calcNormal(hitPos);
+        vec3 col = shade(hitPos, n, ray.dir);
+        
+        // Color based on iteration count (step count)
+        vec3 iterCol = vec3(sin(float(stepCount) * 0.1) * 0.5 + 0.5,
+                            cos(float(stepCount) * 0.15) * 0.5 + 0.5,
+                            sin(float(stepCount) * 0.05 + 2.0) * 0.5 + 0.5);
+        
+        // Blend iteration coloring with surface color
+        col = mix(col, iterCol, 0.3);
+        
+        // Add glow based on distance traveled (closer = more glow)
+        float glow = pow(1.0 - (t / u_maxDist), 3.0) * 0.5;
+        col += vec3(0.5, 0.6, 1.0) * glow;  // Cyan/blue glow
+        
+        outCol = vec4(col, 1.0);
+    } else {
+        // No hit: use distance-based coloring for atmosphere effect
+        // Glow effect for near-misses
+        if (minDistance < 0.5) {
+            float glowIntensity = pow(1.0 - (minDistance / 0.5), 2.0) * 0.8;
+            outCol = vec4(u_bgColor + vec3(0.5, 0.3, 0.8) * glowIntensity, 1.0);
+        }
+        
+        // Color based on iteration count even for misses
+        vec3 bgCol = u_bgColor;
+        bgCol += vec3(sin(float(stepCount) * 0.05) * 0.1,
+                      cos(float(stepCount) * 0.08) * 0.1,
+                      sin(float(stepCount) * 0.03) * 0.1);
+
+        outCol = vec4(bgCol, 1.0);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────── //
+    // ─────────────────────────── DISPLAY DEBUG BUFFERS ─────────────────────────── //
+    // ───────────────────────────────────────────────────────────────────────────── //
+
+    switch(u_buffer)
+    {
+        case 0:
+            // Visualize final color
+            imageStore(u_output, gliID, outCol);
+            break;
+        
+        case 1:
+            // Visualize cone depth sampled from cone prepass texture
+            float depthNorm = tCone;// / u_maxDist;
+            imageStore(u_output, gliID, vec4(vec3(depthNorm), 1.0));
+            break;
+
+        case 2:
+            // Visualize main raymarch depth
+            float mainDepthNorm = min(t, u_maxDist) / u_maxDist;
+            imageStore(u_output, gliID, vec4(vec3(mainDepthNorm), 1.0));
+            break;
+
+        case 3:
+            // Visualize step count
+            float stepNorm = float(stepCount) / float(u_maxStepsMain);
+            imageStore(u_output, gliID, vec4(vec3(stepNorm), 1.0));
+            break;
+        
+        case 4:
+            // Visualize minimum distance to surface (for misses)
+            float minDistNorm = clamp(minDistance / 1.0, 0.0, 1.0);
+            imageStore(u_output, gliID, vec4(vec3(minDistNorm), 1.0));
+            break;
+
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────── //
+    // ───────────────────────────────────────────────────────────────────────────── //
+    // ───────────────────────────────────────────────────────────────────────────── //
+
+}
+
+// ──────────────────────────────────────────────────────────────────────── //
+//                             MAIN ENTRY OUTPUT                            //
+// ──────────────────────────────────────────────────────────────────────── //
+
+void main() {
+    if (u_pass == 0) {
+        runConePrepass();
+    } else {
+        runMainRaymarch();
+    }
+}
