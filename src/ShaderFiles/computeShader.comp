@@ -1,18 +1,22 @@
 #version 460 core
 layout(local_size_x = 8, local_size_y = 4) in;
-layout(r32f, binding = 0) uniform image2D u_coneDepth;
-layout(rgba32f, binding = 1) uniform image2D u_output;
+layout(r32f, binding = 0) uniform image2D u_cascade1Depth;  // Coarse
+layout(r32f, binding = 1) uniform image2D u_cascade2Depth;  // Medium
+layout(r32f, binding = 2) uniform image2D u_cascade3Depth;  // Fine
+layout(rgba32f, binding = 3) uniform image2D u_output;
 
 #include "hg_sdf.hlsl"
 
 // ──────────────────────────────────────────────────────────────────────── //
 //                            VARIABLES & UNIFORMS                          //
 // ──────────────────────────────────────────────────────────────────────── //
-uniform int   u_pass;
 uniform ivec2 u_fullRes;
-uniform ivec2 u_coneRes;
+uniform ivec2 u_cascade1Res;    // Coarse grid resolution
+uniform ivec2 u_cascade2Res;    // Medium grid resolution
+uniform ivec2 u_cascade3Res;    // Fine grid resolution
 uniform float u_fov;
 uniform float u_time;
+uniform int   u_passType;       // 0 = cascade1, 1 = cascade2, 2 = cascade3, 3 = main raymarch
 
 // ─────────────────────────── Camera & Output ──────────────────────────── //
 uniform vec3  u_camPos;
@@ -89,92 +93,68 @@ Ray makePrimaryRay(vec2 fragCoord, vec2 resolution) {
 // ──────────────────────────────────────────────────────────────────────── //
 //                             SDF SCENE COMPUTE                            //
 // ──────────────────────────────────────────────────────────────────────── //
-
-float DE(vec3 p)
+vec4 qSquare( in vec4 q )
 {
-    // Apply time-based rotation
-    float timeRotX = u_time * 0.3;
-    float timeRotY = u_time * 0.5;
+    return vec4(q.x*q.x - q.y*q.y - q.z*q.z - q.w*q.w, 2.0*q.x*q.yzw);
+}
+vec4 qCube( in vec4 q )
+{
+    vec4  q2 = q*q;
+    return vec4(q.x  *(    q2.x - 3.0*q2.y - 3.0*q2.z - 3.0*q2.w), 
+                q.yzw*(3.0*q2.x -     q2.y -     q2.z -     q2.w));
+}
+float qLength2( in vec4 q ) { return dot(q,q); }
+
+vec2 JS( in vec3 p )
+{
+    vec4 z = vec4( p, 0.0 );
+    float dz2 = 1.0;
+	float m2  = 0.0;
+    float n   = 0.0;
+    const vec4  kC = vec4(-2,6,15,-6)/22.0;
+    //const vec4  kC = vec4(1,-0.4,-.4,.2);
+    #ifdef TRAPS
+    float o   = 1e10;
+    #endif
     
-    float cx = cos(timeRotX);
-    float sx = sin(timeRotX);
-    p.yz = vec2(p.y * cx - p.z * sx, p.y * sx + p.z * cx);
+    for( int i=0; i<200; i++ ) 
+	{
+        // z' = 3z² -> |z'|² = 9|z²|²
+		dz2 *= 9.0*qLength2(qSquare(z));
+        
+        // z = z³ + c		
+		z = qCube( z ) + kC;
+        
+        // stop under divergence		
+        m2 = qLength2(z);		
+
+        // orbit trapping : https://iquilezles.org/articles/orbittraps3d
+        #ifdef TRAPS
+        o = min( o, length(z.xz-vec2(0.45,0.55))-0.1 );
+        #endif
+        
+        // exit condition
+        if( m2>256.0 ) break;				 
+		n += 1.0;
+	}
+   
+	// sdf(z) = log|z|·|z|/|dz| : https://iquilezles.org/articles/distancefractals
+	float d = 0.25*log(m2)*sqrt(m2/dz2);
     
-    float cy = cos(timeRotY);
-    float sy = sin(timeRotY);
-    p.xz = vec2(p.x * cy + p.z * sy, -p.x * sy + p.z * cy);
+    #ifdef TRAPS
+    d = min(o,d);
+    #endif
+    #ifdef CUT
+    d = max(d, p.y);
+    #endif
     
-    // Create unfolding effect: vary power and zoom over time
-    float power = mix(2.0, 8.0, sin(u_time * 0.5) * 0.5 + 0.5); // Morphs between power 2 and 8
-    float zoom = 1.0 + sin(u_time * 0.3) * 0.5; // Subtle zoom pulsing
-    
-    p *= zoom;
-    
-    vec3 z = p;
-    float dr = 1.0;
-    float r = 0.0;
-    
-    for(int i = 0; i < 12; i++) {
-        r = length(z);
-        if(r > 2.0) break;
-        
-        // ────────────────────────────────────────────────────────────────
-        // BOX FOLD TRANSFORM (creates cubic/geometric patterns)
-        // ────────────────────────────────────────────────────────────────
-        float boxFold = 1.0;
-        if(z.x > boxFold) z.x = 2.0 * boxFold - z.x;
-        if(z.y > boxFold) z.y = 2.0 * boxFold - z.y;
-        if(z.z > boxFold) z.z = 2.0 * boxFold - z.z;
-        
-        if(z.x < -boxFold) z.x = -2.0 * boxFold - z.x;
-        if(z.y < -boxFold) z.y = -2.0 * boxFold - z.y;
-        if(z.z < -boxFold) z.z = -2.0 * boxFold - z.z;
-        
-        // ────────────────────────────────────────────────────────────────
-        // SPHERICAL FOLD TRANSFORM (radius inversion)
-        // ────────────────────────────────────────────────────────────────
-        float sphereFold = 0.0;
-        float rSq = dot(z, z);
-        if(rSq < 0.5) {
-            z *= 4.0; // Inner fold
-            dr *= 4.0;
-        } else if(rSq < sphereFold) {
-            float fac = sphereFold / rSq;
-            z *= fac;
-            dr *= fac;
-        }
-        
-        // ────────────────────────────────────────────────────────────────
-        // SINE WARP (adds organic ripples and deformations)
-        // ────────────────────────────────────────────────────────────────
-        z.x += sin(z.y * 2.0 + u_time * 0.5) * 0.15;
-        z.y += cos(z.z * 2.0 + u_time * 0.3) * 0.15;
-        z.z += sin(z.x * 1.5) * 0.1;
-        
-        // ────────────────────────────────────────────────────────────────
-        // MANDELBULB POWER ITERATION
-        // ────────────────────────────────────────────────────────────────
-        // Convert to spherical coordinates
-        float theta = acos(clamp(z.z / r, -1.0, 1.0));
-        float phi = atan(z.y, z.x);
-        
-        dr = pow(r, power - 1.0) * power * dr + 1.0;
-        
-        r = pow(r, power);
-        theta = theta * power;
-        phi = phi * power;
-        
-        // Convert back to Cartesian
-        z = r * vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta)) + p;
-    }
-    
-    return 0.5 * log(r) * r / dr;
+	return vec2(d, n);        
 }
 
 // Simple demo scene: a sphere over a floor
 float sdfScene(vec3 p) {
-    //return fBlob(p); 
-    return DE(p);
+    float cubeDisplaycment = cos(u_time / 3.0) * 0.5 + 1.25;
+    return max(JS(p).r, -(fBox(vec3(p) - vec3(0, cubeDisplaycment, 0.15f) , vec3(1.15f))));
 }
 
 // ──────────────────────────────────────────────────────────────────────── //
@@ -203,49 +183,34 @@ vec3 shade(vec3 pos, vec3 n, vec3 rayDir) {
 }
 
 // ──────────────────────────────────────────────────────────────────────── //
-//                           CONE PREPASS (PASS 0)                          //
-//                  Or how i like to call it... a cat prepass               //
-//                                                                          //
-//                                   ╱|、                                   //
-//                                  (˚ˎ。7                                  //
-//                                   |、˜〵        < Thats me               //
-//                                   じし ˍ,)ノ     while I write this code //
+//                          CASCADING CONE PREPASS                          //
+//                    Cascade1 → Cascade2 → Cascade3 → Main                 //
 // ──────────────────────────────────────────────────────────────────────── //
 
-void runConePrepass() {
-    ivec2 gliID = ivec2(gl_GlobalInvocationID.xy);
-    // Clamp to avoid out-of-bounds writes
-    if (gliID.x >= u_coneRes.x || gliID.y >= u_coneRes.y)
-        return;
-
-    // Convert cone cell coordinates to full-resolution pixel coordinates (center of cell)
-    vec2 pixelsPerCone = vec2(u_fullRes) / vec2(u_coneRes);
-    vec2 fullResCoord = (vec2(gliID) + vec2(0.5)) * pixelsPerCone;
+// Cascade 1: Coarse pass
+void runCascade1(ivec2 gliID) {
+    vec2 pixelsPerCell = vec2(u_fullRes) / vec2(u_cascade1Res);
+    vec2 fullResCoord = (vec2(gliID) + vec2(0.5)) * pixelsPerCell;
     
     Ray ray = makePrimaryRay(fullResCoord, vec2(u_fullRes));
 
-    float blockHalf = max(pixelsPerCone.x, pixelsPerCone.y) * 0.5;
-
+    float blockHalf = max(pixelsPerCell.x, pixelsPerCell.y) * 0.5;
     float pixelSizeY_at_z1 = 2.0 * tan(u_fov * 0.5) / float(u_fullRes.y);
-    float coneAngle        = blockHalf * pixelSizeY_at_z1;
+    float coneAngle = blockHalf * pixelSizeY_at_z1;
 
-    float t     = 0.0;
-    float safeT = u_maxDist; // default = no hit
+    float t = 0.0;
+    float safeT = u_maxDist;
 
     for (int i = 0; i < u_maxStepsCone; ++i) {
         vec3 pos = ray.origin + t * ray.dir;
+        float d = sdfScene(pos);
+        float cr = t * coneAngle;
 
-        float d  = sdfScene(pos);
-        float cr = t * coneAngle;    // cone radius at distance t
-
-        // If distance <= cone radius, the cone is touching geometry
         if (d <= cr) {
-            // conservative depth a bit before actual contact
             safeT = max(t - cr, 0.0);
             break;
         }
 
-        // cone-aware step; 0.001 avoids stall when d ~ cr
         float stepLen = max(d - cr, 0.001);
         t += stepLen;
 
@@ -253,9 +218,99 @@ void runConePrepass() {
             break;
     }
 
-    float depthNorm = safeT;
-    imageStore(u_coneDepth, gliID, vec4(1.0, 0.0, 0.0, 1.0));
+    imageStore(u_cascade1Depth, gliID, vec4(safeT));
+}
 
+// Cascade 2: Medium pass (refines cascade1 hits)
+void runCascade2(ivec2 gliID) {
+    vec2 cascade2toCascade1 = vec2(u_cascade1Res) / vec2(u_cascade2Res);
+    ivec2 cascade1ID = ivec2(vec2(gliID) * cascade2toCascade1);
+    cascade1ID = clamp(cascade1ID, ivec2(0), u_cascade1Res - ivec2(1));
+
+    float cascade1Depth = imageLoad(u_cascade1Depth, cascade1ID).r;
+    
+    if (cascade1Depth >= u_maxDist - 1e-3) {
+        imageStore(u_cascade2Depth, gliID, vec4(u_maxDist));
+        return;
+    }
+
+    vec2 pixelsPerCell = vec2(u_fullRes) / vec2(u_cascade2Res);
+    vec2 fullResCoord = (vec2(gliID) + vec2(0.5)) * pixelsPerCell;
+    
+    Ray ray = makePrimaryRay(fullResCoord, vec2(u_fullRes));
+
+    float blockHalf = max(pixelsPerCell.x, pixelsPerCell.y) * 0.5;
+    float pixelSizeY_at_z1 = 2.0 * tan(u_fov * 0.5) / float(u_fullRes.y);
+    float coneAngle = blockHalf * pixelSizeY_at_z1;
+
+    // Start from cascade1's depth to skip already-marched distance
+    float t = max(cascade1Depth - 0.5, 0.0);  // Small margin for safety
+    float safeT = u_maxDist;
+
+    for (int i = 0; i < u_maxStepsCone; ++i) {
+        vec3 pos = ray.origin + t * ray.dir;
+        float d = sdfScene(pos);
+        float cr = t * coneAngle;
+
+        if (d <= cr) {
+            safeT = max(t - cr, 0.0);
+            break;
+        }
+
+        float stepLen = max(d - cr, 0.001);
+        t += stepLen;
+
+        if (t > u_maxDist)
+            break;
+    }
+
+    imageStore(u_cascade2Depth, gliID, vec4(safeT));
+}
+
+// Cascade 3: Fine pass (refines cascade2 hits)
+void runCascade3(ivec2 gliID) {
+    vec2 cascade3toCascade2 = vec2(u_cascade2Res) / vec2(u_cascade3Res);
+    ivec2 cascade2ID = ivec2(vec2(gliID) * cascade3toCascade2);
+    cascade2ID = clamp(cascade2ID, ivec2(0), u_cascade2Res - ivec2(1));
+
+    float cascade2Depth = imageLoad(u_cascade2Depth, cascade2ID).r;
+    
+    if (cascade2Depth >= u_maxDist - 1e-3) {
+        imageStore(u_cascade3Depth, gliID, vec4(u_maxDist));
+        return;
+    }
+
+    vec2 pixelsPerCell = vec2(u_fullRes) / vec2(u_cascade3Res);
+    vec2 fullResCoord = (vec2(gliID) + vec2(0.5)) * pixelsPerCell;
+    
+    Ray ray = makePrimaryRay(fullResCoord, vec2(u_fullRes));
+
+    float blockHalf = max(pixelsPerCell.x, pixelsPerCell.y) * 0.5;
+    float pixelSizeY_at_z1 = 2.0 * tan(u_fov * 0.5) / float(u_fullRes.y);
+    float coneAngle = blockHalf * pixelSizeY_at_z1;
+
+    // Start from cascade2's depth to skip already-marched distance
+    float t = max(cascade2Depth - 0.5, 0.0);  // Small margin for safety
+    float safeT = u_maxDist;
+
+    for (int i = 0; i < u_maxStepsCone; ++i) {
+        vec3 pos = ray.origin + t * ray.dir;
+        float d = sdfScene(pos);
+        float cr = t * coneAngle;
+
+        if (d <= cr) {
+            safeT = max(t - cr, 0.0);
+            break;
+        }
+
+        float stepLen = max(d - cr, 0.001);
+        t += stepLen;
+
+        if (t > u_maxDist)
+            break;
+    }
+
+    imageStore(u_cascade3Depth, gliID, vec4(safeT));
 }
 
 // ──────────────────────────────────────────────────────────────────────── //
@@ -263,8 +318,8 @@ void runConePrepass() {
 // ──────────────────────────────────────────────────────────────────────── //
 
 float sampleConeDepthBilinear(ivec2 pixel) {
-    // Map full-res pixel to cone grid float coords
-    vec2 scale = vec2(u_coneRes) / vec2(u_fullRes);
+    // Map full-res pixel to cascade3 grid float coords
+    vec2 scale = vec2(u_cascade3Res) / vec2(u_fullRes);
     vec2 gridPos = (vec2(pixel) + vec2(0.5)) * scale - vec2(0.5);
 
     ivec2 i0 = ivec2(floor(gridPos));
@@ -274,15 +329,15 @@ float sampleConeDepthBilinear(ivec2 pixel) {
 
     vec2 f = fract(gridPos);
 
-    i0 = clamp(i0, ivec2(0), u_coneRes - ivec2(1));
-    i1 = clamp(i1, ivec2(0), u_coneRes - ivec2(1));
-    i2 = clamp(i2, ivec2(0), u_coneRes - ivec2(1));
-    i3 = clamp(i3, ivec2(0), u_coneRes - ivec2(1));
+    i0 = clamp(i0, ivec2(0), u_cascade3Res - ivec2(1));
+    i1 = clamp(i1, ivec2(0), u_cascade3Res - ivec2(1));
+    i2 = clamp(i2, ivec2(0), u_cascade3Res - ivec2(1));
+    i3 = clamp(i3, ivec2(0), u_cascade3Res - ivec2(1));
 
-    float d00 = imageLoad(u_coneDepth, i0).r;
-    float d10 = imageLoad(u_coneDepth, i1).r;
-    float d01 = imageLoad(u_coneDepth, i2).r;
-    float d11 = imageLoad(u_coneDepth, i3).r;
+    float d00 = imageLoad(u_cascade3Depth, i0).r;
+    float d10 = imageLoad(u_cascade3Depth, i1).r;
+    float d01 = imageLoad(u_cascade3Depth, i2).r;
+    float d11 = imageLoad(u_cascade3Depth, i3).r;
 
     float dx0 = mix(d00, d10, f.x);
     float dx1 = mix(d01, d11, f.x);
@@ -291,18 +346,14 @@ float sampleConeDepthBilinear(ivec2 pixel) {
     return d;
 }
 
-void runMainRaymarch() {
-    ivec2 gliID = ivec2(gl_GlobalInvocationID.xy);
-    if (gliID.x >= u_fullRes.x || gliID.y >= u_fullRes.y)
-        return;
-
+void runMainRaymarch(ivec2 gliID) {
     Ray ray = makePrimaryRay(gliID, u_fullRes);
     float tCone = sampleConeDepthBilinear(gliID);
 
-    // If cone pass didn’t hit anything, tCone will be ~u_maxDist
+    // If cone pass didn't hit anything, tCone will be ~u_maxDist
     if (tCone >= u_maxDist - 1e-3) {
         imageStore(u_output, gliID, vec4(u_bgColor, 1.0));
-        return;
+        if(u_buffer != 3) return;
     }
 
     // Start a bit *before* cone depth to be safe
@@ -349,21 +400,6 @@ void runMainRaymarch() {
         col += vec3(0.5, 0.6, 1.0) * glow;  // Cyan/blue glow
         
         outCol = vec4(col, 1.0);
-    } else {
-        // No hit: use distance-based coloring for atmosphere effect
-        // Glow effect for near-misses
-        if (minDistance < 0.5) {
-            float glowIntensity = pow(1.0 - (minDistance / 0.5), 2.0) * 0.8;
-            outCol = vec4(u_bgColor + vec3(0.5, 0.3, 0.8) * glowIntensity, 1.0);
-        }
-        
-        // Color based on iteration count even for misses
-        vec3 bgCol = u_bgColor;
-        bgCol += vec3(sin(float(stepCount) * 0.05) * 0.1,
-                      cos(float(stepCount) * 0.08) * 0.1,
-                      sin(float(stepCount) * 0.03) * 0.1);
-
-        outCol = vec4(bgCol, 1.0);
     }
 
     // ───────────────────────────────────────────────────────────────────────────── //
@@ -374,34 +410,49 @@ void runMainRaymarch() {
     {
         case 0:
             // Visualize final color
-            imageStore(u_output, gliID, outCol);
+            outCol = outCol;
+            // I guess this case doesn't require any explanation
             break;
         
         case 1:
-            // Visualize cone depth sampled from cone prepass texture
-            float depthNorm = tCone;// / u_maxDist;
-            imageStore(u_output, gliID, vec4(vec3(depthNorm), 1.0));
+            // Visualize normals
+            outCol = vec4(calcNormal(hitPos), 1.0);
             break;
 
         case 2:
-            // Visualize main raymarch depth
-            float mainDepthNorm = min(t, u_maxDist) / u_maxDist;
-            imageStore(u_output, gliID, vec4(vec3(mainDepthNorm), 1.0));
+            // Visualize step count
+            outCol = vec4(vec3(float(stepCount) / float(u_maxStepsMain)), 1.0);
             break;
 
         case 3:
-            // Visualize step count
-            float stepNorm = float(stepCount) / float(u_maxStepsMain);
-            imageStore(u_output, gliID, vec4(vec3(stepNorm), 1.0));
+            // Visualize cascade depth
+            outCol = vec4(0.0);
+            // Check cascade 1
+            float depthLoaded = imageLoad(u_cascade1Depth, ivec2(vec2(gliID) * vec2(u_cascade1Res) / vec2(u_fullRes))).r;
+            if(depthLoaded >= u_maxDist - 1e-3) outCol += vec4(0.2, 0.0, 0.0, 1.0);
+            else outCol                                += vec4(0.0, 0.2, 0.0, 1.0);
+            
+            depthLoaded = 0.0;
+            // Check cascade 2
+            depthLoaded = imageLoad(u_cascade2Depth, ivec2(vec2(gliID) * vec2(u_cascade2Res) / vec2(u_fullRes))).r;
+            if(depthLoaded >= u_maxDist - 1e-3) outCol += vec4(0.2, 0.0, 0.0, 1.0);
+            else outCol                                += vec4(0.0, 0.2, 0.0, 1.0);
+
+            depthLoaded = 0.0;
+            // Check cascade 3
+            depthLoaded = imageLoad(u_cascade3Depth, ivec2(vec2(gliID) * vec2(u_cascade3Res) / vec2(u_fullRes))).r;
+            if(depthLoaded >= u_maxDist - 1e-3) outCol += vec4(0.2, 0.0, 0.0, 1.0);
+            else outCol                                += vec4(0.0, 0.2, 0.0, 1.0);
+
             break;
-        
         case 4:
             // Visualize minimum distance to surface (for misses)
-            float minDistNorm = clamp(minDistance / 1.0, 0.0, 1.0);
-            imageStore(u_output, gliID, vec4(vec3(minDistNorm), 1.0));
+            outCol = vec4(vec3(clamp(minDistance / 1.0, 0.0, 1.0)), 1.0);
             break;
 
     }
+
+    imageStore(u_output, gliID, outCol);
 
     // ───────────────────────────────────────────────────────────────────────────── //
     // ───────────────────────────────────────────────────────────────────────────── //
@@ -414,9 +465,26 @@ void runMainRaymarch() {
 // ──────────────────────────────────────────────────────────────────────── //
 
 void main() {
-    if (u_pass == 0) {
-        runConePrepass();
-    } else {
-        runMainRaymarch();
+    ivec2 gliID = ivec2(gl_GlobalInvocationID.xy);
+
+    if (u_passType == 0) {
+        if (gliID.x < u_cascade1Res.x && gliID.y < u_cascade1Res.y) {
+            runCascade1(gliID);
+        }
+    } 
+    else if (u_passType == 1) {
+        if (gliID.x < u_cascade2Res.x && gliID.y < u_cascade2Res.y) {
+            runCascade2(gliID);
+        }
+    }
+    else if (u_passType == 2) {
+        if (gliID.x < u_cascade3Res.x && gliID.y < u_cascade3Res.y) {
+            runCascade3(gliID);
+        }
+    }
+    else if (u_passType == 3) {
+        if (gliID.x < u_fullRes.x && gliID.y < u_fullRes.y) {
+            runMainRaymarch(gliID);
+        }
     }
 }

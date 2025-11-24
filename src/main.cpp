@@ -29,6 +29,11 @@ int s_height = INIT_HEIGHT;
 int   disp_fps = 0;
 float disp_ms  = 0.0f;
 
+// Cascade cone marching resolution scales
+int cascadeScale1 = 120;  // pixels per cell
+int cascadeScale2 = 60;   // pixels per cell
+int cascadeScale3 = 2;    // pixels per cell
+
 float vertices[] = {
     -1.0f, -1.0f,  0.0f, 0.0f,
     1.0f, -1.0f,  1.0f, 0.0f,
@@ -66,22 +71,56 @@ void getFrameRate(int* disp_fps, float* disp_ms)
     *disp_ms = ms;
 }
 
-void Dispatch(bool isConePass)
+void Dispatch(bool isConePass) //Deprecated
 {
     int dispatchX, dispatchY;
     
     if (isConePass) {
-        // Pass 0: Dispatch over cone grid (width/8 × height/8)
-        int coneResX = std::max(1, s_width / 8);
-        int coneResY = std::max(1, s_height / 8);
-        dispatchX = std::max(1, (int)ceil((float)coneResX / 8.0f));
-        dispatchY = std::max(1, (int)ceil((float)coneResY / 4.0f));
+        // Coarse cone pass: Dispatch over coarse grid (width/128 × height/128 for example)
+        int coarseResX = std::max(1, s_width / 128);
+        int coarseResY = std::max(1, s_height / 128);
+        dispatchX = std::max(1, (int)ceil((float)coarseResX / float(8)));
+        dispatchY = std::max(1, (int)ceil((float)coarseResY / float(4)));
     } else {
         // Pass 1: Dispatch over full resolution
-        dispatchX = std::max(1, (int)ceil((float)s_width / 8.0f));
-        dispatchY = std::max(1, (int)ceil((float)s_height / 4.0f));
+        dispatchX = std::max(1, (int)ceil((float)s_width / float(8)));
+        dispatchY = std::max(1, (int)ceil((float)s_height / float(4)));
     }
     
+    glDispatchCompute(dispatchX, dispatchY, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+}
+
+void DispatchPass(int passType, GLuint computeProgram)
+{
+    int dispatchX, dispatchY;
+    int resX, resY;
+    
+    if (passType == 0) {
+        // Cascade1: coarse dispatch
+        resX = std::max(1, s_width / cascadeScale1);
+        resY = std::max(1, s_height / cascadeScale1);
+    }
+    else if (passType == 1) {
+        // Cascade2: medium dispatch
+        resX = std::max(1, s_width / cascadeScale2);
+        resY = std::max(1, s_height / cascadeScale2);
+    }
+    else if (passType == 2) {
+        // Cascade3: fine dispatch
+        resX = std::max(1, s_width / cascadeScale3);
+        resY = std::max(1, s_height / cascadeScale3);
+    }
+    else {
+        // Main raymarch: full resolution
+        resX = s_width;
+        resY = s_height;
+    }
+    
+    dispatchX = std::max(1, (int)ceil((float)resX / float(8)));
+    dispatchY = std::max(1, (int)ceil((float)resY / float(4)));
+    
+    glUniform1i(glGetUniformLocation(computeProgram, "u_passType"), passType);
     glDispatchCompute(dispatchX, dispatchY, 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 }
@@ -199,7 +238,13 @@ int main()
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
-    GLFWwindow* window = glfwCreateWindow(INIT_WIDTH, INIT_HEIGHT, "Name i guess", NULL, NULL);
+    GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+    const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+    // Create fullscreen window (borderless fullscreen)
+    GLFWwindow* window = glfwCreateWindow(mode->width, mode->height, "Cone Marching Fractal", monitor, NULL);
+    s_width = mode->width;
+    s_height = mode->height;
+    
     glfwMakeContextCurrent(window);
     glfwSwapInterval(false); // Disable/Enable V-Sync
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
@@ -259,15 +304,38 @@ int main()
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
 
-    GLuint coneDepthTex;
-    glGenTextures(1, &coneDepthTex);
-    glBindTexture(GL_TEXTURE_2D, coneDepthTex);
+    // Cascade1 cone depth texture (coarse, cascadeScale1 pixels per cell)
+    GLuint cascade1DepthTex;
+    glGenTextures(1, &cascade1DepthTex);
+    glBindTexture(GL_TEXTURE_2D, cascade1DepthTex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, std::max(1, s_width / 8), std::max(1, s_height / 8), 0, GL_R32F, GL_FLOAT, NULL);
-    glBindImageTexture(0, coneDepthTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, std::max(1, s_width / cascadeScale1), std::max(1, s_height / cascadeScale1), 0, GL_RED, GL_FLOAT, NULL);
+    glBindImageTexture(0, cascade1DepthTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+
+    // Cascade2 cone depth texture (medium, cascadeScale2 pixels per cell)
+    GLuint cascade2DepthTex;
+    glGenTextures(1, &cascade2DepthTex);
+    glBindTexture(GL_TEXTURE_2D, cascade2DepthTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, std::max(1, s_width / cascadeScale2), std::max(1, s_height / cascadeScale2), 0, GL_RED, GL_FLOAT, NULL);
+    glBindImageTexture(1, cascade2DepthTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+
+    // Cascade3 cone depth texture (fine, cascadeScale3 pixels per cell)
+    GLuint cascade3DepthTex;
+    glGenTextures(1, &cascade3DepthTex);
+    glBindTexture(GL_TEXTURE_2D, cascade3DepthTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, std::max(1, s_width / cascadeScale3), std::max(1, s_height / cascadeScale3), 0, GL_RED, GL_FLOAT, NULL);
+    glBindImageTexture(2, cascade3DepthTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
 
     GLuint outputTex;
     glGenTextures(1, &outputTex);
@@ -277,7 +345,7 @@ int main()
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, s_width, s_height, 0, GL_RGBA, GL_FLOAT, NULL);
-    glBindImageTexture(1, outputTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+    glBindImageTexture(3, outputTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
 
 
 
@@ -289,6 +357,7 @@ int main()
         getFrameRate(&disp_fps, &disp_ms);
         glfwGetWindowSize(window, &s_width, &s_height);
         glfwSetWindowTitle(window, ("ConeMarching Prepass test - fps: " + std::to_string(disp_fps) + " | ms: "+ std::to_string(disp_ms)).c_str());
+        cout<<"FPS: " << disp_fps << " | MS: " << disp_ms << "\r";
 
         camera.ProcessInputs(window, s_width, s_height);
 
@@ -297,21 +366,29 @@ int main()
         glUniform3f(glGetUniformLocation(computeProgram, "u_camPos"),   camera.Position.x, camera.Position.y, camera.Position.z);
         glUniform3f(glGetUniformLocation(computeProgram, "u_camRot"),   glm::radians(camera.pitch), glm::radians(camera.yaw), 0.0f);
         glUniform2i(glGetUniformLocation(computeProgram, "u_fullRes"),  s_width, s_height);
-        glUniform2i(glGetUniformLocation(computeProgram, "u_coneRes"),  std::max(1, s_width / 8), std::max(1, s_height / 8));
+        glUniform2i(glGetUniformLocation(computeProgram, "u_cascade1Res"), std::max(1, s_width / cascadeScale1), std::max(1, s_height / cascadeScale1));
+        glUniform2i(glGetUniformLocation(computeProgram, "u_cascade2Res"), std::max(1, s_width / cascadeScale2), std::max(1, s_height / cascadeScale2));
+        glUniform2i(glGetUniformLocation(computeProgram, "u_cascade3Res"), std::max(1, s_width / cascadeScale3), std::max(1, s_height / cascadeScale3));
         glUniform1f(glGetUniformLocation(computeProgram, "u_fov"),      glm::radians(60.0f));
         glUniform1i(glGetUniformLocation(computeProgram, "u_buffer"),   camera.activeBuffer);
 
-        // ──────────────────────────── PASS 0: Cone Prepass ───────────────────────────── //
-        glUniform1i(glGetUniformLocation(computeProgram, "u_pass"), 0);
-        glBindImageTexture(0, coneDepthTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
-        glBindImageTexture(1, outputTex,    0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);  // Bind output for pass 0
-        Dispatch(true);
+        // ──────────────────────────── Cascading Cone Prepass ──────────────────────────── //
+        // Pass 0: Cascade1 (coarse)
+        glBindImageTexture(0, cascade1DepthTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+        glBindImageTexture(1, cascade2DepthTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+        glBindImageTexture(2, cascade3DepthTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+        glBindImageTexture(3, outputTex,        0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
+        DispatchPass(0, computeProgram);
 
-        // ──────────────────────────── PASS 1: Main Raymarch ──────────────────────────── //
-        glUniform1i(glGetUniformLocation(computeProgram, "u_pass"), 1);
-        glBindImageTexture(0, coneDepthTex, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32F);
-        glBindImageTexture(1, outputTex,    0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
-        Dispatch(false);
+        // Pass 1: Cascade2 (medium, refines cascade1 hits)
+        DispatchPass(1, computeProgram);
+
+        // Pass 2: Cascade3 (fine, refines cascade2 hits)
+        DispatchPass(2, computeProgram);
+
+        // Pass 3: Main raymarch (uses cascade3 depth)
+        glBindImageTexture(3, outputTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+        DispatchPass(3, computeProgram);
 
         // ─────────────────────────────── Render to screen ────────────────────────────── //
         glUseProgram(shaderProgram);
