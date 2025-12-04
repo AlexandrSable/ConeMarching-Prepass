@@ -21,6 +21,7 @@ class Camera
         glm::vec3 Orientation = glm::vec3(0.0f, 0.0f, -1.0f);
 
         bool firstClick = true;
+        bool contolledByPlayer = false;
 
         int width;
         int height;
@@ -32,7 +33,7 @@ class Camera
 
         BufferType activeBuffer = FINAL; 
 
-        Camera(int width, int height, glm::vec3 Position);
+        Camera(int width, int height, glm::vec3 Position, bool controlledByPlayer);
         void scroll_callback(GLFWwindow* window, double xoffset, double yoffset);
         void ProcessInputs(GLFWwindow *window, int width, int height);
 };

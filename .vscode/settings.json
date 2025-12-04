@@ -66,5 +66,6 @@
         "cinttypes": "cpp",
         "iomanip": "cpp"
     },
-    "cmake.sourceDirectory": "D:/Portfolio/OpenGL/FractalPS/include/glm"
+    "cmake.sourceDirectory": "D:/Portfolio/OpenGL/FractalPS/include/glm",
+    "C_Cpp.errorSquiggles": "disabled"
 }

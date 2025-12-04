@@ -3,35 +3,23 @@
 
 using namespace std;
 
-Camera::Camera(int width, int height, glm::vec3 position)
+Camera::Camera(int width, int height, glm::vec3 position, bool controlledByPlayer)
 {
     Camera::width = width;
     Camera::height = height;
     Position = position;
+    Camera::contolledByPlayer = controlledByPlayer;
 }
 
 void Camera::ProcessInputs(GLFWwindow *window, int width, int height)
 {
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
-        Position += speed * Orientation; // Forward
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
-        Position += speed * -Orientation; // Backward
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
-        Position += speed * glm::cross(Orientation, glm::vec3(0.0, 1.0, 0.0)); // Left
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
-        Position += -speed * glm::cross(Orientation, glm::vec3(0.0, 1.0, 0.0)); // Right
-    if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS)
-        Position += speed * glm::vec3(0.0f, 1.0f, 0.0f); // Up
-    if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS)
-        Position += speed * glm::vec3(0.0f, -1.0f, 0.0f); // Down   
+    // Check current owner
+    if(!contolledByPlayer)
+        return;
 
+    // When controlled by player, only handle mouse rotation (position is set externally)
+    // Don't process WASD movement - that's handled by player physics
 
-    if(glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
-        speed = 0.1f;
-    else if(glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_RELEASE)
-        speed = 0.01f;
-    
-    
     if(glfwGetKey(window, GLFW_KEY_F1) == GLFW_PRESS)
         activeBuffer = FINAL;
     if(glfwGetKey(window, GLFW_KEY_F2) == GLFW_PRESS)
@@ -42,9 +30,8 @@ void Camera::ProcessInputs(GLFWwindow *window, int width, int height)
         activeBuffer = ID;
     if(glfwGetKey(window, GLFW_KEY_F5) == GLFW_PRESS)
         activeBuffer = STEPCOUNT;
-    
-        
-        
+
+
     if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS)
     {
         glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);

@@ -5,11 +5,27 @@ layout(r32f, binding = 1) uniform image2D u_cascade2Depth;  // Medium
 layout(r32f, binding = 2) uniform image2D u_cascade3Depth;  // Fine
 layout(rgba32f, binding = 3) uniform image2D u_output;
 
-#include "hg_sdf.hlsl"
+// Planet data SSBO
+struct PlanetData {
+    vec4 positionRadius;  // xyz = position, w = radius
+    vec4 colorGravity;    // xyz = color, w = gravity strength
+};
+
+layout(std430, binding = 4) readonly buffer PlanetBuffer {
+    PlanetData planets[];
+};
+
+uniform int u_numPlanets = 0;  // Number of planets
 
 // ──────────────────────────────────────────────────────────────────────── //
 //                            VARIABLES & UNIFORMS                          //
 // ──────────────────────────────────────────────────────────────────────── //
+uniform float   u_maxDist = 50.0f;
+uniform float   u_epsilon = 0.01f;
+uniform int     u_maxStepsCone = 64;  // Increased from 32 since cascades start fresh
+uniform int     u_maxStepsMain = 128;
+uniform float   u_coneMultiplier = 1.25;  // Cone step width: increase for wider cone acceptance
+
 uniform ivec2 u_fullRes;
 uniform ivec2 u_cascade1Res;    // Coarse grid resolution
 uniform ivec2 u_cascade2Res;    // Medium grid resolution
@@ -17,6 +33,7 @@ uniform ivec2 u_cascade3Res;    // Fine grid resolution
 uniform float u_fov;
 uniform float u_time;
 uniform int   u_passType;       // 0 = cascade1, 1 = cascade2, 2 = cascade3, 3 = main raymarch
+uniform int   u_aaSamples;      // Anti-aliasing: number of samples per pixel side (1 = off, 2 = 2x2 = 4 samples)
 
 // ─────────────────────────── Camera & Output ──────────────────────────── //
 uniform vec3  u_camPos;
@@ -24,12 +41,12 @@ uniform vec3  u_camRot;
 uniform int   u_buffer;     
 
 // ─────────────────────────── Render constants ─────────────────────────── //
-const float   u_maxDist = 100.0f;
-const float   u_epsilon = 0.001f;
-const int     u_maxStepsCone = 128;
-const int     u_maxStepsMain = 128;
-
 const vec3    u_bgColor = vec3(0.05f, 0.05f, 0.1f);
+
+// ─────────────────────────── Stupid Includes  ─────────────────────────── //
+#include "hg_sdf.hlsl"
+#include "map.hlsl"
+#include "materials.hlsl"
 
 // ──────────────────────────────────────────────────────────────────────── //
 //                              TYPES & UTILITIES                           //
@@ -90,72 +107,31 @@ Ray makePrimaryRay(vec2 fragCoord, vec2 resolution) {
     return r;
 }
 
-// ──────────────────────────────────────────────────────────────────────── //
-//                             SDF SCENE COMPUTE                            //
-// ──────────────────────────────────────────────────────────────────────── //
-vec4 qSquare( in vec4 q )
-{
-    return vec4(q.x*q.x - q.y*q.y - q.z*q.z - q.w*q.w, 2.0*q.x*q.yzw);
-}
-vec4 qCube( in vec4 q )
-{
-    vec4  q2 = q*q;
-    return vec4(q.x  *(    q2.x - 3.0*q2.y - 3.0*q2.z - 3.0*q2.w), 
-                q.yzw*(3.0*q2.x -     q2.y -     q2.z -     q2.w));
-}
-float qLength2( in vec4 q ) { return dot(q,q); }
+float doConeMarching(Ray ray, float d) {
+    float cd;
+    float ccr;
+    float camTanFov = tan(radians(u_fov / 2));
+    for (int i = 0; i < u_maxStepsCone; ++i) {
+        vec3 p = ray.origin + d * ray.dir;
+        float cd = mapSDF(p).x;
+        ccr = (d * camTanFov) * 2.0 / (0.5 * float(u_fullRes.y));
 
-vec2 JS( in vec3 p )
-{
-    vec4 z = vec4( p, 0.0 );
-    float dz2 = 1.0;
-	float m2  = 0.0;
-    float n   = 0.0;
-    const vec4  kC = vec4(-2,6,15,-6)/22.0;
-    //const vec4  kC = vec4(1,-0.4,-.4,.2);
-    #ifdef TRAPS
-    float o   = 1e10;
-    #endif
-    
-    for( int i=0; i<200; i++ ) 
-	{
-        // z' = 3z² -> |z'|² = 9|z²|²
-		dz2 *= 9.0*qLength2(qSquare(z));
-        
-        // z = z³ + c		
-		z = qCube( z ) + kC;
-        
-        // stop under divergence		
-        m2 = qLength2(z);		
+        if(cd < ccr * 1.25 || d >= u_maxDist) break;
 
-        // orbit trapping : https://iquilezles.org/articles/orbittraps3d
-        #ifdef TRAPS
-        o = min( o, length(z.xz-vec2(0.45,0.55))-0.1 );
-        #endif
-        
-        // exit condition
-        if( m2>256.0 ) break;				 
-		n += 1.0;
-	}
-   
-	// sdf(z) = log|z|·|z|/|dz| : https://iquilezles.org/articles/distancefractals
-	float d = 0.25*log(m2)*sqrt(m2/dz2);
-    
-    #ifdef TRAPS
-    d = min(o,d);
-    #endif
-    #ifdef CUT
-    d = max(d, p.y);
-    #endif
-    
-	return vec2(d, n);        
+        if (cd > 15.0 && i > 8) {
+            d = u_maxDist;
+            break;
+        }
+
+        d += cd;
+
+        if (d > u_maxDist)
+            break;
+    }
+
+    return d;
 }
 
-// Simple demo scene: a sphere over a floor
-float sdfScene(vec3 p) {
-    float cubeDisplaycment = cos(u_time / 3.0) * 0.5 + 1.25;
-    return max(JS(p).r, -(fBox(vec3(p) - vec3(0, cubeDisplaycment, 0.15f) , vec3(1.15f))));
-}
 
 // ──────────────────────────────────────────────────────────────────────── //
 //                             NORMAL & SHADING                             //
@@ -165,20 +141,37 @@ vec3 calcNormal(vec3 p) {
     const vec2 e = vec2(1.0, -1.0) * 0.001;
 
     return normalize(
-        e.xyy * sdfScene(p + e.xyy) +
-        e.yyx * sdfScene(p + e.yyx) +
-        e.yxy * sdfScene(p + e.yxy) +
-        e.xxx * sdfScene(p + e.xxx)
+        e.xyy * mapSDF(p + e.xyy).x +
+        e.yyx * mapSDF(p + e.yyx).x +
+        e.yxy * mapSDF(p + e.yxy).x +
+        e.xxx * mapSDF(p + e.xxx).x
     );
 }
 
-vec3 shade(vec3 pos, vec3 n, vec3 rayDir) {
-    vec3 lightDir = normalize(vec3(0.3, 0.7, 0.2));
+vec3 getObjectColor(float objIndex) {
+    // If object index is 0, it's the fractal - use default red
+    if (objIndex < 0.5) {
+        return vec3(1.0, 0.0, 0.0);  // Red for fractal
+    }
+    
+    // Otherwise it's a planet - look up its color from SSBO
+    int planetIdx = int(objIndex) - 1;
+    if (planetIdx >= 0 && planetIdx < u_numPlanets) {
+        return planets[planetIdx].colorGravity.xyz;
+    }
+    
+    return vec3(1.0);  // Fallback white
+}
+
+vec3 shade(vec3 pos, vec3 n, vec3 rayDir, float objIndex) {
+    vec3  lightDir = normalize(vec3(0.3, 0.7, 0.2));
     float diff    = max(dot(n, lightDir), 0.0);
     float spec    = pow(max(dot(reflect(-lightDir, n), -rayDir), 0.0), 32.0);
 
-    vec3 baseColor = vec3(0.4, 0.75, 1.0);
-    vec3 col = baseColor * (0.2 + 0.8 * diff) + vec3(1.0) * spec * 0.25;
+    // Get color based on object type
+    vec3 baseColor = getObjectColor(objIndex);
+    
+    vec3 col = baseColor * diff + vec3(1.0) * spec * 0.25;
     return col;
 }
 
@@ -187,41 +180,21 @@ vec3 shade(vec3 pos, vec3 n, vec3 rayDir) {
 //                    Cascade1 → Cascade2 → Cascade3 → Main                 //
 // ──────────────────────────────────────────────────────────────────────── //
 
-// Cascade 1: Coarse pass
+// Cascade 1: Coarse pass (simple distance marching, no cone angle)
 void runCascade1(ivec2 gliID) {
     vec2 pixelsPerCell = vec2(u_fullRes) / vec2(u_cascade1Res);
     vec2 fullResCoord = (vec2(gliID) + vec2(0.5)) * pixelsPerCell;
     
     Ray ray = makePrimaryRay(fullResCoord, vec2(u_fullRes));
 
-    float blockHalf = max(pixelsPerCell.x, pixelsPerCell.y) * 0.5;
-    float pixelSizeY_at_z1 = 2.0 * tan(u_fov * 0.5) / float(u_fullRes.y);
-    float coneAngle = blockHalf * pixelSizeY_at_z1;
-
     float t = 0.0;
     float safeT = u_maxDist;
-
-    for (int i = 0; i < u_maxStepsCone; ++i) {
-        vec3 pos = ray.origin + t * ray.dir;
-        float d = sdfScene(pos);
-        float cr = t * coneAngle;
-
-        if (d <= cr) {
-            safeT = max(t - cr, 0.0);
-            break;
-        }
-
-        float stepLen = max(d - cr, 0.001);
-        t += stepLen;
-
-        if (t > u_maxDist)
-            break;
-    }
+    safeT = doConeMarching(ray, t);
 
     imageStore(u_cascade1Depth, gliID, vec4(safeT));
 }
 
-// Cascade 2: Medium pass (refines cascade1 hits)
+// Cascade 2: Medium pass (simple distance marching, no cone angle)
 void runCascade2(ivec2 gliID) {
     vec2 cascade2toCascade1 = vec2(u_cascade1Res) / vec2(u_cascade2Res);
     ivec2 cascade1ID = ivec2(vec2(gliID) * cascade2toCascade1);
@@ -239,35 +212,14 @@ void runCascade2(ivec2 gliID) {
     
     Ray ray = makePrimaryRay(fullResCoord, vec2(u_fullRes));
 
-    float blockHalf = max(pixelsPerCell.x, pixelsPerCell.y) * 0.5;
-    float pixelSizeY_at_z1 = 2.0 * tan(u_fov * 0.5) / float(u_fullRes.y);
-    float coneAngle = blockHalf * pixelSizeY_at_z1;
-
-    // Start from cascade1's depth to skip already-marched distance
-    float t = max(cascade1Depth - 0.5, 0.0);  // Small margin for safety
+    float t = max(cascade1Depth - 0.5, 0.0);
     float safeT = u_maxDist;
-
-    for (int i = 0; i < u_maxStepsCone; ++i) {
-        vec3 pos = ray.origin + t * ray.dir;
-        float d = sdfScene(pos);
-        float cr = t * coneAngle;
-
-        if (d <= cr) {
-            safeT = max(t - cr, 0.0);
-            break;
-        }
-
-        float stepLen = max(d - cr, 0.001);
-        t += stepLen;
-
-        if (t > u_maxDist)
-            break;
-    }
+    safeT = doConeMarching(ray, t);
 
     imageStore(u_cascade2Depth, gliID, vec4(safeT));
 }
 
-// Cascade 3: Fine pass (refines cascade2 hits)
+// Cascade 3: Fine pass (simple distance marching, no cone angle)
 void runCascade3(ivec2 gliID) {
     vec2 cascade3toCascade2 = vec2(u_cascade2Res) / vec2(u_cascade3Res);
     ivec2 cascade2ID = ivec2(vec2(gliID) * cascade3toCascade2);
@@ -285,32 +237,36 @@ void runCascade3(ivec2 gliID) {
     
     Ray ray = makePrimaryRay(fullResCoord, vec2(u_fullRes));
 
-    float blockHalf = max(pixelsPerCell.x, pixelsPerCell.y) * 0.5;
-    float pixelSizeY_at_z1 = 2.0 * tan(u_fov * 0.5) / float(u_fullRes.y);
-    float coneAngle = blockHalf * pixelSizeY_at_z1;
-
-    // Start from cascade2's depth to skip already-marched distance
-    float t = max(cascade2Depth - 0.5, 0.0);  // Small margin for safety
+    float t = max(cascade2Depth - 0.5, 0.0);
     float safeT = u_maxDist;
-
-    for (int i = 0; i < u_maxStepsCone; ++i) {
-        vec3 pos = ray.origin + t * ray.dir;
-        float d = sdfScene(pos);
-        float cr = t * coneAngle;
-
-        if (d <= cr) {
-            safeT = max(t - cr, 0.0);
-            break;
-        }
-
-        float stepLen = max(d - cr, 0.001);
-        t += stepLen;
-
-        if (t > u_maxDist)
-            break;
-    }
+    safeT = doConeMarching(ray, t);
 
     imageStore(u_cascade3Depth, gliID, vec4(safeT));
+}
+
+// ──────────────────────────────────────────────────────────────────────── //
+//                               MSAA FUNCTIONS                             //
+// ──────────────────────────────────────────────────────────────────────── //
+
+// Pseudo-random number generator for jittered sampling
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+// Get jittered sample offset within pixel
+vec2 getJitteredOffset(int sampleIndex, int totalSamples, vec2 pixelCoord) {
+    int sqrtSamples = int(sqrt(float(totalSamples)));
+    int x = sampleIndex % sqrtSamples;
+    int y = sampleIndex / sqrtSamples;
+    
+    float basePosX = float(x) / float(sqrtSamples);
+    float basePosY = float(y) / float(sqrtSamples);
+    
+    // Add random jitter within sub-pixel
+    float jitterX = hash(pixelCoord + vec2(x, y)) / float(sqrtSamples);
+    float jitterY = hash(pixelCoord + vec2(y, x + 0.5)) / float(sqrtSamples);
+    
+    return vec2(basePosX + jitterX, basePosY + jitterY);
 }
 
 // ──────────────────────────────────────────────────────────────────────── //
@@ -347,60 +303,88 @@ float sampleConeDepthBilinear(ivec2 pixel) {
 }
 
 void runMainRaymarch(ivec2 gliID) {
-    Ray ray = makePrimaryRay(gliID, u_fullRes);
-    float tCone = sampleConeDepthBilinear(gliID);
-
-    // If cone pass didn't hit anything, tCone will be ~u_maxDist
-    if (tCone >= u_maxDist - 1e-3) {
-        imageStore(u_output, gliID, vec4(u_bgColor, 1.0));
-        if(u_buffer != 3) return;
-    }
-
-    // Start a bit *before* cone depth to be safe
-    float t = max(tCone - 1.0, 0.0);
-
-    bool hit = false;
-    vec3 hitPos = vec3(0.0);
-    int stepCount = 0;
-    float minDistance = u_maxDist;  // Track minimum distance to surface (for glow)
-
-    for (int i = 0; i < u_maxStepsMain; ++i) {
-        hitPos = ray.origin + t * ray.dir;
-        float d = sdfScene(hitPos);
+    vec4 accumulatedColor = vec4(0.0);
+    int totalSamples = u_aaSamples * u_aaSamples;
+    
+    // For debug visualization, track stats from center sample
+    vec3 debugHitPos = vec3(0.0);
+    int debugStepCount = 0;
+    float debugMinDistance = u_maxDist;
+    bool debugHit = false;
+    
+    for (int sampleIdx = 0; sampleIdx < totalSamples; ++sampleIdx) {
+        // Get jittered sub-pixel offset for this sample
+        vec2 jitterOffset = getJitteredOffset(sampleIdx, totalSamples, vec2(gliID));
+        vec2 samplePixel = vec2(gliID) + jitterOffset;
         
-        minDistance = min(minDistance, d);  // Track closest approach
-        stepCount = i;
+        Ray ray = makePrimaryRay(samplePixel, u_fullRes);
+        float tCone = sampleConeDepthBilinear(ivec2(samplePixel));
 
-        if (d < u_epsilon) {
-            hit = true;
-            break;
+        // If cone pass didn't hit anything, skip this sample
+        if (tCone >= u_maxDist - 1e-3) {
+            accumulatedColor += vec4(u_bgColor, 1.0);
+            continue;
         }
 
-        t += d;
-        if (t > u_maxDist)
-            break;
-    }
+        // Start a bit *before* cone depth to be safe
+        float t = max(tCone - 1.0, 0.0);
 
-    vec4 outCol = vec4(u_bgColor, 1.0);
+        bool hit = false;
+        vec3 hitPos = vec3(0.0);
+        int stepCount = 0;
+        float minDistance = u_maxDist;
+        
+        // Adaptive iteration reduction for close-up optimization
+        int maxSteps = u_maxStepsMain;
+        if (tCone < 5.0) maxSteps = 80;
+        else if (tCone < 15.0) maxSteps = 100;
 
-    if (hit) {
-        vec3 n   = calcNormal(hitPos);
-        vec3 col = shade(hitPos, n, ray.dir);
+        float objectIndex = 0.0;  // Track which object was hit
         
-        // Color based on iteration count (step count)
-        vec3 iterCol = vec3(sin(float(stepCount) * 0.1) * 0.5 + 0.5,
-                            cos(float(stepCount) * 0.15) * 0.5 + 0.5,
-                            sin(float(stepCount) * 0.05 + 2.0) * 0.5 + 0.5);
+        for (int i = 0; i < maxSteps; ++i) {
+            hitPos = ray.origin + t * ray.dir;
+            vec2 mapResult = mapSDF(hitPos);
+            float d = mapResult.x;
+            objectIndex = mapResult.y;  // Capture object index
+            
+            minDistance = min(minDistance, d);
+            stepCount = i;
+
+            if (d < u_epsilon) {
+                hit = true;
+                break;
+            }
+
+            if (d > 15.0 && i > 10) {
+                break;
+            }
+
+            t += d;
+            if (t > u_maxDist)
+                break;
+        }
+
+        vec4 sampleCol = vec4(u_bgColor, 1.0);
+
+        if (hit) {
+            vec3 n   = calcNormal(hitPos);
+            vec3 col = shade(hitPos, n, ray.dir, objectIndex);
+            sampleCol = vec4(col, 1.0);
+        }
+
+        accumulatedColor += sampleCol;
         
-        // Blend iteration coloring with surface color
-        col = mix(col, iterCol, 0.3);
-        
-        // Add glow based on distance traveled (closer = more glow)
-        float glow = pow(1.0 - (t / u_maxDist), 3.0) * 0.5;
-        col += vec3(0.5, 0.6, 1.0) * glow;  // Cyan/blue glow
-        
-        outCol = vec4(col, 1.0);
+        // Store debug info from first (center) sample
+        if (sampleIdx == 0) {
+            debugHitPos = hitPos;
+            debugStepCount = stepCount;
+            debugMinDistance = minDistance;
+            debugHit = hit;
+        }
     }
+    
+    // Average the accumulated samples
+    vec4 outCol = accumulatedColor / float(totalSamples);
 
     // ───────────────────────────────────────────────────────────────────────────── //
     // ─────────────────────────── DISPLAY DEBUG BUFFERS ─────────────────────────── //
@@ -411,17 +395,18 @@ void runMainRaymarch(ivec2 gliID) {
         case 0:
             // Visualize final color
             outCol = outCol;
-            // I guess this case doesn't require any explanation
             break;
         
         case 1:
             // Visualize normals
-            outCol = vec4(calcNormal(hitPos), 1.0);
+            if (debugHit) {
+                outCol = vec4(calcNormal(debugHitPos), 1.0);
+            }
             break;
 
         case 2:
             // Visualize step count
-            outCol = vec4(vec3(float(stepCount) / float(u_maxStepsMain)), 1.0);
+            outCol = vec4(vec3(float(debugStepCount) / float(u_maxStepsMain)), 1.0);
             break;
 
         case 3:
@@ -439,7 +424,7 @@ void runMainRaymarch(ivec2 gliID) {
             else outCol                                += vec4(0.0, 0.2, 0.0, 1.0);
 
             depthLoaded = 0.0;
-            // Check cascade 3
+            // Check cascade 3   
             depthLoaded = imageLoad(u_cascade3Depth, ivec2(vec2(gliID) * vec2(u_cascade3Res) / vec2(u_fullRes))).r;
             if(depthLoaded >= u_maxDist - 1e-3) outCol += vec4(0.2, 0.0, 0.0, 1.0);
             else outCol                                += vec4(0.0, 0.2, 0.0, 1.0);
@@ -447,7 +432,7 @@ void runMainRaymarch(ivec2 gliID) {
             break;
         case 4:
             // Visualize minimum distance to surface (for misses)
-            outCol = vec4(vec3(clamp(minDistance / 1.0, 0.0, 1.0)), 1.0);
+            outCol = vec4(vec3(clamp(debugMinDistance / 1.0, 0.0, 1.0)), 1.0);
             break;
 
     }
