@@ -543,7 +543,7 @@ int main()
         glBindImageTexture(0, cascade1DepthTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
         DispatchPass(0, computeProgram);
         glEndQuery(GL_TIME_ELAPSED);
-
+ 
         // Pass 1: Cascade2 (medium, refines cascade1 hits)
         glBeginQuery(GL_TIME_ELAPSED, timingQueries[1]);
         glBindImageTexture(1, cascade2DepthTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
